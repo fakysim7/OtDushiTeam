@@ -1,0 +1,10 @@
+# Файл: bot/requirements.txt
+aiogram==3.*
+httpx
+redis
+python-dotenv
+pandas
+aiogram-calendar
+openpyxl
+phonenumbers
+firebase-admin
