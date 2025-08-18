@@ -1,7 +1,0 @@
-fastapi
-sqlalchemy
-alembic
-psycopg2-binary
-python-dotenv
-uvicorn[standard]
-firebase-admin
