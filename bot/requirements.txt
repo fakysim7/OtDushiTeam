@@ -8,3 +8,4 @@ aiogram-calendar
 openpyxl
 phonenumbers
 firebase-admin
+pytz==2023.3
