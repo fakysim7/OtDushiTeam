@@ -3,12 +3,14 @@ from aiogram import Router, types, F
 from aiogram.fsm.context import FSMContext
 from aiogram.filters import CommandStart
 from aiogram.fsm.state import StatesGroup, State
+import pytz
 import httpx
 from config import API_URL
 from datetime import datetime
 from keyboards.main import main_menu
 from russian_calendar import RussianCalendar, CalendarCallback
 from keyboards.inline import duration_kb, dynamic_hours_kb, place_kb
+from utils.admin_notify import notify_admin_new_booking
 from typing import Optional, Dict
 import phonenumbers
 from phonenumbers.phonenumberutil import NumberParseException
@@ -88,20 +90,47 @@ async def select_place(callback: types.CallbackQuery, state: FSMContext):
 
 @router.callback_query(CalendarCallback.filter(), ReserveState.date)
 async def process_date(callback_query: types.CallbackQuery, callback_data: CalendarCallback, state: FSMContext):
+    import pytz
+    
     selected, selected_date = await RussianCalendar().process_selection(callback_query, callback_data)
 
     if not selected:
-        # Нажата навигация или недоступный день — ничего не делаем (alert уже показан в календаре)
         return
 
-    # Здесь можно не проверять снова прошедшую дату — календарь сам блокирует их и показывает alert
-
-    await state.update_data(date=selected_date.strftime("%Y-%m-%d"))
+    selected_date_str = selected_date.strftime("%Y-%m-%d")
+    await state.update_data(date=selected_date_str)
+    
+    # Формируем красивое отображение даты
+    formatted_date = selected_date.strftime('%d.%m.%Y')
+    
+    # Проверяем по московскому времени
+    moscow_tz = pytz.timezone('Europe/Moscow')
+    now_moscow = datetime.now(moscow_tz)
+    is_today = selected_date.date() == now_moscow.date()
+    
+    if is_today:
+        current_time_str = now_moscow.strftime('%H:%M')
+        message_text = f"Выбрана дата: {formatted_date} (сегодня)\nСейчас: {current_time_str} МСК\nВыберите время:"
+    else:
+        message_text = f"Выбрана дата: {formatted_date}\nВыберите время:"
+    
+    print(f"DEBUG: Отправка выбранной даты в клавиатуру: {selected_date_str}")
+    
     await callback_query.message.answer(
-        f"Выбрана дата: {selected_date.strftime('%d.%m.%Y')}\nВыберите время:",
-        reply_markup=dynamic_hours_kb()
+        message_text,
+        reply_markup=dynamic_hours_kb(selected_date_str)
     )
     await state.set_state(ReserveState.time)
+
+
+@router.callback_query(F.data == "time_unavailable")
+async def time_unavailable_handler(callback: types.CallbackQuery):
+    """Обработчик для случая когда время на сегодня закончилось"""
+    await callback.answer(
+        "⏰ На сегодня доступное время для бронирования закончилось.\n"
+        "Попробуйте выбрать другую дату.",
+        show_alert=True
+    )
 
 @router.callback_query(F.data == "ignore", ReserveState.date)
 async def ignore_past_date(callback: types.CallbackQuery):
@@ -112,10 +141,56 @@ async def ignore_past_date(callback: types.CallbackQuery):
     
 @router.callback_query(F.data.startswith("time_"), ReserveState.time)
 async def select_time(callback: types.CallbackQuery, state: FSMContext):
+    if callback.data == "time_unavailable":
+        await callback.answer(
+            "⏰ На сегодня доступное время для бронирования закончилось.\n"
+            "Попробуйте выбрать другую дату.",
+            show_alert=True
+        )
+        return
+    
     time = callback.data.split("_")[1]
     await state.update_data(time=time)
-    await callback.message.answer("⏱ Укажите продолжительность (в часах):", reply_markup=duration_kb())
+    
+    # Вычисляем время закрытия для выбранного времени
+    try:
+        from datetime import datetime
+        start_time = datetime.strptime(time, "%H:%M")
+        closing_time = datetime.strptime("23:00", "%H:%M")
+        
+        max_hours = (closing_time - start_time).seconds // 3600
+        
+        if max_hours <= 0:
+            await callback.message.answer(
+                f"❌ К сожалению, в {time} заведение уже будет закрываться.\n"
+                "Пожалуйста, выберите более раннее время.",
+                reply_markup=dynamic_hours_kb()
+            )
+            return
+        elif max_hours >= 3:
+            duration_text = "⏱️ Укажите продолжительность (в часах):"
+        else:
+            duration_text = f"⏱️ Укажите продолжительность (в часах):\nЗаведение закрывается в 23:00, максимум {max_hours} ч"
+            
+    except:
+        duration_text = "⏱️ Укажите продолжительность (в часах):"
+    
+    await callback.message.answer(
+        duration_text, 
+        reply_markup=duration_kb(time)  # Передаем выбранное время
+    )
     await state.set_state(ReserveState.duration)
+
+
+
+@router.callback_query(F.data == "duration_unavailable")
+async def duration_unavailable_handler(callback: types.CallbackQuery, state: FSMContext):
+    """Обработчик для случая когда нет доступной продолжительности"""
+    await callback.answer(
+        "❌ Для выбранного времени нет доступной продолжительности.\n"
+        "Заведение закрывается в 23:00. Выберите более раннее время.",
+        show_alert=True
+    )
 
 @router.callback_query(F.data.startswith("duration_"), ReserveState.duration)
 async def select_duration(callback: types.CallbackQuery, state: FSMContext):
@@ -147,6 +222,10 @@ async def get_name(msg: types.Message, state: FSMContext):
 
 @router.message(ReserveState.phone)
 async def get_phone(msg: types.Message, state: FSMContext):
+    # ✅ ЗАЩИТА: Сразу очищаем состояние чтобы предотвратить повторную обработку
+    user_data = await state.get_data()
+    await state.clear()
+    
     try:
         # Парсим номер телефона
         parsed_number = phonenumbers.parse(msg.text, None)
@@ -161,11 +240,21 @@ async def get_phone(msg: types.Message, state: FSMContext):
             phonenumbers.PhoneNumberFormat.INTERNATIONAL
         )
         
-        # Получаем данные из состояния
-        user_data = await state.get_data()
+        # ✅ ПРОВЕРКА: Существует ли уже такая бронь
+        existing_check = await make_api_request("GET", "/get_reservations")
+        
+        # Проверяем на дублирование по user_id + date + time
+        for reservation in existing_check.values() if isinstance(existing_check, dict) else []:
+            if (str(reservation.get("user_id")) == str(msg.from_user.id) and
+                reservation.get("date") == user_data.get("date") and
+                reservation.get("time") == user_data.get("time") and
+                not reservation.get("cancelled")):
+                
+                await msg.answer("❌ У вас уже есть бронь на это время!")
+                return
         
         # Отправляем запрос в API
-        await make_api_request(
+        result = await make_api_request(
             "POST",
             "/reserve",
             json={
@@ -179,11 +268,17 @@ async def get_phone(msg: types.Message, state: FSMContext):
             }
         )
         
+        # ✅ УВЕДОМЛЯЕМ АДМИНОВ:
+        await notify_admin_new_booking(msg.bot, user_data)
+        
         await msg.answer("✅ Бронь успешно отправлена! Ожидайте подтверждения.\n" \
                         "А пока можете ознакомиться с нашим меню https://amelie-cafe.by/menu")
-        await state.clear()  # Очищаем состояние только при успехе
         
     except NumberParseException:
+        # Восстанавливаем состояние для повторного ввода номера
+        await state.set_data(user_data)
+        await state.set_state(ReserveState.phone)
+        
         await msg.answer(
             "⚠️ Пожалуйста, введите корректный номер телефона в международном формате.\n"
             "Примеры:\n"
@@ -193,15 +288,17 @@ async def get_phone(msg: types.Message, state: FSMContext):
             "+7 912 345 67 89 (Россия)\n\n"
             "Попробуйте ввести номер еще раз:"
         )
-        # Не очищаем состояние, чтобы пользователь мог повторить ввод
         return
         
     except Exception as e:
+        # Восстанавливаем состояние для повторного ввода номера
+        await state.set_data(user_data)
+        await state.set_state(ReserveState.phone)
+        
         await msg.answer(
             f"⛔ Произошла ошибка: {str(e)}\n"
             "Пожалуйста, введите номер телефона еще раз:"
         )
-        # Не очищаем состояние при других ошибках
         return
 
 
@@ -215,6 +312,174 @@ PLACE_ADDRESSES = {
 
 @router.message(F.text.lower().in_(["📋 мои брони", "мои брони"]))
 async def my_reservations(msg: types.Message):
+    """Показывает кнопки для выбора категории бронирований"""
+    try:
+        # Получаем все бронирования пользователя
+        user_reservations = await get_user_reservations(msg.from_user.id)
+        
+        if not user_reservations:
+            await msg.answer("У вас нет бронирований.")
+            return
+
+        # Подсчитываем количество в каждой категории
+        categories = await categorize_reservations(user_reservations)
+        
+        active_count = len(categories['active'])
+        pending_count = len(categories['pending'])
+        past_count = len(categories['past'])
+        total_count = len(user_reservations)
+
+        # Создаем клавиатуру с кнопками
+        from aiogram.utils.keyboard import InlineKeyboardBuilder
+        
+        kb = InlineKeyboardBuilder()
+        
+        # Кнопки для каждой категории с количеством
+        kb.button(
+            text=f"✅ Активные ({active_count})",
+            callback_data="reservations_active"
+        )
+        kb.button(
+            text=f"⏳ В ожидании ({pending_count})",
+            callback_data="reservations_pending"
+        )
+        kb.button(
+            text=f"❌ Прошедшие ({past_count})",
+            callback_data="reservations_past"
+        )
+
+        
+        # Располагаем по 2 кнопки в ряд
+        kb.adjust(1, 2)
+
+
+        await msg.answer(
+            "📋 <b>Ваши брони</b>",
+            parse_mode="HTML",
+            reply_markup=kb.as_markup()
+        )
+
+    except Exception as e:
+        await msg.answer(
+            "⚠️ Произошла ошибка при получении бронирований.\n"
+            "Попробуйте позже или обратитесь в поддержку."
+        )
+        print(f"Ошибка при получении бронирований: {str(e)}")
+
+
+@router.callback_query(F.data.startswith("reservations_"))
+async def handle_reservations_callback(callback: types.CallbackQuery):
+    """Объединенный обработчик для всех callback'ов связанных с бронированиями"""
+    try:
+        # Если это кнопка "Назад в меню"
+        if callback.data == "reservations_back":
+            # Получаем все бронирования пользователя
+            user_reservations = await get_user_reservations(callback.from_user.id)
+            
+            if not user_reservations:
+                await callback.message.edit_text("У вас нет бронирований.")
+                return
+
+            # Подсчитываем количество в каждой категории
+            categories = await categorize_reservations(user_reservations)
+            
+            active_count = len(categories['active'])
+            pending_count = len(categories['pending'])
+            past_count = len(categories['past'])
+            total_count = len(user_reservations)
+
+            # Создаем клавиатуру с кнопками
+            from aiogram.utils.keyboard import InlineKeyboardBuilder
+            
+            kb = InlineKeyboardBuilder()
+            
+            kb.button(
+                text=f"✅ Активные ({active_count})",
+                callback_data="reservations_active"
+            )
+            kb.button(
+                text=f"⏳ В ожидании ({pending_count})",
+                callback_data="reservations_pending"
+            )
+            kb.button(
+                text=f"❌ Прошедшие ({past_count})",
+                callback_data="reservations_past"
+            )
+
+            
+            kb.adjust(1, 2)
+
+            await callback.message.edit_text(
+                "📋 <b>Ваши брони</b>",
+                parse_mode="HTML",
+                reply_markup=kb.as_markup()
+            )
+            return
+        
+        # Иначе обрабатываем как выбор категории
+        category = callback.data.replace("reservations_", "")
+        
+        # Получаем все бронирования пользователя
+        user_reservations = await get_user_reservations(callback.from_user.id)
+        
+        if not user_reservations:
+            await callback.message.edit_text("У вас нет бронирований.")
+            return
+
+        # Категоризируем бронирования
+        categories = await categorize_reservations(user_reservations)
+        
+        # Определяем какую категорию показать
+        if category == "active":
+            reservations_to_show = categories['active']
+            title = "✅ <b>Активные</b>"
+            empty_message = "У вас нет активных бронирований."
+        elif category == "pending":
+            reservations_to_show = categories['pending']
+            title = "⏳ <b>В ожидании</b>"
+            empty_message = "У вас нет бронирований в ожидании."
+        elif category == "past":
+            reservations_to_show = categories['past']
+            title = "❌ <b>Прошедшие</b>"
+            empty_message = "У вас нет прошедших бронирований."
+
+
+        # Формируем ответ
+        if not reservations_to_show:
+            response = f"{title}\n\n{empty_message}"
+        else:
+            response = f"{title}\n\n"
+            
+            # Сортируем бронирования
+            reservations_to_show.sort(key=lambda x: (x.get("date", ""), x.get("time", "")))
+            
+            for i, res in enumerate(reservations_to_show, 1):
+                response += await format_reservation(res, i)
+                # Добавляем разделитель между бронированиями, кроме последней
+                if i < len(reservations_to_show):
+                    response += "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        # Создаем кнопку "Назад"
+        from aiogram.utils.keyboard import InlineKeyboardBuilder
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🔙 Назад в меню", callback_data="reservations_back")
+        
+        
+        kb.adjust(1)
+
+        await callback.message.edit_text(
+            response,
+            parse_mode="HTML",
+            reply_markup=kb.as_markup()
+        )
+        
+    except Exception as e:
+        await callback.answer("⚠️ Произошла ошибка при загрузке бронирований", show_alert=True)
+        print(f"Ошибка при работе с бронированиями: {str(e)}")
+
+
+async def get_user_reservations(user_id: int) -> list:
+    """Получает все бронирования пользователя"""
     try:
         # Получаем все бронирования
         reservations_response = await make_api_request("GET", "/get_reservations")
@@ -229,74 +494,132 @@ async def my_reservations(msg: types.Message):
         # Фильтруем брони текущего пользователя
         user_reservations = [
             res for res in reservations_list
-            if isinstance(res, dict) and str(res.get("user_id")) == str(msg.from_user.id)
+            if isinstance(res, dict) and str(res.get("user_id")) == str(user_id)
         ]
-
-        if not user_reservations:
-            await msg.answer("У вас нет бронирований.")
-            return
-
-        # Сортируем по дате и времени
-        user_reservations.sort(key=lambda x: (x.get("date", ""), x.get("time", "")))
-
-        response = "📋 <b>Ваши брони:</b>\n\n"
         
-        for i, res in enumerate(user_reservations, 1):
-            # Определяем статус брони
-            if res.get("cancelled") or res.get("status") == "cancelled":
-                status = "❌ Отменена"
-                status_icon = "❌"
-            elif res.get("confirmed") or res.get("status") == "confirmed":
-                status = "✅ Подтверждена"
-                status_icon = "✅"
-            else:
-                status = "⏳ В ожидании"
-                status_icon = "⏳"
-            
-            # Преобразуем ID места в адрес
-            raw_place = res.get('place', 'Не указано')
-            if str(raw_place) in PLACE_ADDRESSES:
-                place = PLACE_ADDRESSES[str(raw_place)]
-            else:
-                place = raw_place if raw_place != 'Не указано' else 'Не указано'
-            
-            response += (
-                f"{status_icon} <b>Бронь #{i}</b>\n"
-                f"👤 Имя: {res.get('name', 'Не указано')}\n"
-                f"🏠 Место: {place}\n"
-                f"📅 Дата: {res.get('date', 'Не указана')}\n"
-                f"⏰ Время: {res.get('time', 'Не указано')}\n"
-                f"⏱ Длительность: {res.get('duration', 'Не указана')} ч\n"
-                f"📞 Телефон: {res.get('phone', 'Не указан')}\n"
-                f"📌 Статус: {status}\n"
-            )
-            
-            # Добавляем информацию о дате отмены если есть
-            if res.get("cancelled_at"):
-                try:
-                    cancelled_date = datetime.fromisoformat(res["cancelled_at"])
-                    response += f"🕒 Отменена: {cancelled_date.strftime('%d.%m.%Y %H:%M')}\n"
-                except:
-                    pass
-            
-            # Добавляем информацию о дате подтверждения если есть
-            elif res.get("confirmed_at"):
-                try:
-                    confirmed_date = datetime.fromisoformat(res["confirmed_at"])
-                    response += f"🕒 Подтверждена: {confirmed_date.strftime('%d.%m.%Y %H:%M')}\n"
-                except:
-                    pass
-            
-            response += "\n"
+        return user_reservations
         
-        await msg.answer(response, parse_mode="HTML")
-
     except Exception as e:
-        await msg.answer(
-            "⚠️ Произошла ошибка при получении бронирований.\n"
-            "Попробуйте позже или обратитесь в поддержку."
-        )
-        print(f"Ошибка при получении бронирований: {str(e)}")
+        print(f"Ошибка при получении бронирований пользователя: {str(e)}")
+        return []
+
+
+async def categorize_reservations(reservations: list) -> dict:
+    """Разделяет бронирования по категориям"""
+    # Получаем текущую дату
+    current_date = datetime.now().date()
+    
+    active_reservations = []      # Подтвержденные и предстоящие
+    pending_reservations = []     # В ожидании подтверждения
+    past_reservations = []        # Прошедшие или отмененные
+
+    for res in reservations:
+        try:
+            # Получаем дату бронирования
+            reservation_date = datetime.strptime(res.get('date', ''), '%Y-%m-%d').date()
+            is_past = reservation_date < current_date
+            
+            # Определяем статус
+            is_cancelled = res.get("cancelled") or res.get("status") == "cancelled"
+            is_confirmed = res.get("confirmed") or res.get("status") == "confirmed"
+            
+            if is_cancelled or is_past:
+                past_reservations.append(res)
+            elif is_confirmed:
+                active_reservations.append(res)
+            else:
+                pending_reservations.append(res)
+                
+        except ValueError:
+            # Если не удается распарсить дату, отправляем в прошедшие
+            past_reservations.append(res)
+
+    return {
+        'active': active_reservations,
+        'pending': pending_reservations,
+        'past': past_reservations
+    }
+
+
+async def format_reservation(res: dict, number: int) -> str:
+    """Форматирует бронирование для отображения в новом формате"""
+    import pytz
+    
+    # Определяем статус и иконку
+    if res.get("cancelled") or res.get("status") == "cancelled":
+        status_icon = "❌"
+        status_text = "❌ Отменена"
+    elif res.get("confirmed") or res.get("status") == "confirmed":
+        status_icon = "✅"
+        status_text = "✅ Подтверждена"
+    else:
+        status_icon = "⏳"
+        status_text = "⏳ В ожидании"
+    
+    # Преобразуем ID места в адрес
+    raw_place = res.get('place', 'Не указано')
+    if str(raw_place) in PLACE_ADDRESSES:
+        place = PLACE_ADDRESSES[str(raw_place)]
+    else:
+        place = raw_place if raw_place != 'Не указано' else 'Не указано'
+    
+    formatted = (
+        f"{status_icon} <b>Бронь #{number}</b>\n"
+        f"👤 Имя: {res.get('name', 'Не указано')}\n"
+        f"📞 Телефон: {res.get('phone', 'Не указан')}\n\n"
+        
+        f"🏠 Место: {place}\n"
+        f"📅 Дата: {res.get('date', 'Не указана')}\n"
+        f"⏰ Время: {res.get('time', 'Не указано')}\n"
+        f"⏱️ Длительность: {res.get('duration', 1)} ч\n\n"
+        
+        f"📌 Статус: {status_text}"
+    )
+    
+    # Московская временная зона
+    moscow_tz = pytz.timezone('Europe/Moscow')
+    
+    # Добавляем информацию о предзаказе если есть
+    if res.get("preorder"):
+        formatted += f"\n🍽 Предзаказ: Отмечен"
+        if res.get("preorder_at"):
+            try:
+                # Парсим время и конвертируем в МСК
+                preorder_utc = datetime.fromisoformat(res["preorder_at"].replace('Z', '+00:00'))
+                if preorder_utc.tzinfo is None:
+                    # Если нет информации о зоне, считаем что UTC
+                    preorder_utc = preorder_utc.replace(tzinfo=pytz.UTC)
+                preorder_moscow = preorder_utc.astimezone(moscow_tz)
+                formatted += f" ({preorder_moscow.strftime('%d.%m.%Y %H:%M')})"
+            except:
+                pass
+    
+    # Добавляем дополнительную информацию о датах операций
+    if res.get("cancelled_at"):
+        try:
+            # Парсим время отмены и конвертируем в МСК
+            cancelled_utc = datetime.fromisoformat(res["cancelled_at"].replace('Z', '+00:00'))
+            if cancelled_utc.tzinfo is None:
+                cancelled_utc = cancelled_utc.replace(tzinfo=pytz.UTC)
+            cancelled_moscow = cancelled_utc.astimezone(moscow_tz)
+            formatted += f"\n🕑 Отменена: {cancelled_moscow.strftime('%d.%m.%Y в %H:%M')} "
+        except Exception as e:
+            print(f"DEBUG: Ошибка парсинга cancelled_at: {e}")
+            pass
+    elif res.get("confirmed_at"):
+        try:
+            # Парсим время подтверждения и конвертируем в МСК
+            confirmed_utc = datetime.fromisoformat(res["confirmed_at"].replace('Z', '+00:00'))
+            if confirmed_utc.tzinfo is None:
+                confirmed_utc = confirmed_utc.replace(tzinfo=pytz.UTC)
+            confirmed_moscow = confirmed_utc.astimezone(moscow_tz)
+            formatted += f"\n🕑 Подтверждена: {confirmed_moscow.strftime('%d.%m.%Y в %H:%M')} "
+        except Exception as e:
+            print(f"DEBUG: Ошибка парсинга confirmed_at: {e}")
+            pass
+    
+    formatted += "\n\n"
+    return formatted
 
 
 # Функция для отмены собственной брони пользователем (если нужно)
@@ -409,4 +732,3 @@ async def help_command(msg: types.Message):
         "Напишите \"📅 Забронировать\", чтобы оставить заявку на столик.\n"
         "Администратор подтвердит вашу бронь в течение нескольких минут."
     )
-
