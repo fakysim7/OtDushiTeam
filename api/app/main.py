@@ -1,66 +1,8 @@
-# from fastapi import FastAPI, HTTPException, Depends, Query
-# from sqlalchemy.orm import Session
-# from . import models, schemas, crud
-# from .database import engine, get_db
-# from fastapi.middleware.cors import CORSMiddleware
-# from datetime import datetime, timedelta
-
-# models.Base.metadata.create_all(bind=engine)
-
-# app = FastAPI()
-
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=["*"],
-#     allow_credentials=True,
-#     allow_methods=["*"],
-#     allow_headers=["*"],
-# )
-
-# @app.post("/reserve")
-# def reserve(reservation: schemas.ReservationCreate, db: Session = Depends(get_db)):
-#     end_time = (datetime.strptime(reservation.time, "%H:%M") + timedelta(hours=reservation.duration)).time()
-#     if end_time > datetime.strptime("22:00", "%H:%M").time():
-#         raise HTTPException(status_code=400, detail="Кафе закрывается в 22:00")
-
-#     if not crud.is_time_slot_available(db, reservation.date, reservation.time, reservation.duration, reservation.place):
-#         raise HTTPException(status_code=400, detail="Нет свободных столиков на это время")
-
-#     return crud.create_reservation(db, reservation)
-
-# @app.get("/check")
-# def check(
-#     date: str = Query(...),
-#     time: str = Query(...),
-#     duration: int = Query(1),
-#     place: str = Query(...),
-#     db: Session = Depends(get_db)
-# ):
-#     end_time = (datetime.strptime(time, "%H:%M") + timedelta(hours=duration)).time()
-#     if end_time > datetime.strptime("23:00", "%H:%M").time():
-#         return {"free": 0}
-#     free = crud.get_free_tables(db, date, time, duration, place)
-#     return {"free": free}
-
-# @app.get("/get_reservations")
-# def get_reservations(db: Session = Depends(get_db)):
-#     return crud.get_all_reservations(db)
-
-# @app.get("/get_reservations/{date}")
-# def get_reservations_by_date(date: str, db: Session = Depends(get_db)):
-#     return crud.get_reservations_by_date(db, date)
-
-# @app.post("/confirm")
-# def confirm(user_id: int, date: str, time: str, db: Session = Depends(get_db)):
-#     result = crud.confirm_reservation(db, user_id, date, time)
-#     if not result:
-#         raise HTTPException(status_code=404, detail="Reservation not found")
-#     return {"status": "confirmed"}
-
 #app/main.py
 from fastapi import FastAPI, HTTPException, Query
 from datetime import datetime, timedelta
 from . import schemas, crud
+import pytz
 from fastapi.middleware.cors import CORSMiddleware
 import firebase_admin
 from firebase_admin import db
@@ -77,10 +19,40 @@ app.add_middleware(
 
 @app.post("/reserve")
 def reserve(reservation: schemas.ReservationCreate):
-    end_time = (datetime.strptime(reservation.time, "%H:%M") + timedelta(hours=reservation.duration)).time()
-    if end_time > datetime.strptime("22:00", "%H:%M").time():
-        raise HTTPException(status_code=400, detail="Кафе закрывается в 22:00")
+    import pytz
+    
+    # Получаем московское время
+    moscow_tz = pytz.timezone('Europe/Moscow')
+    now_moscow = datetime.now(moscow_tz)
+    
+    # Проверяем время закрытия заведения (23:00)
+    start_time = datetime.strptime(reservation.time, "%H:%M")
+    end_time = start_time + timedelta(hours=reservation.duration)
+    
+    if end_time.time() > datetime.strptime("23:00", "%H:%M").time():
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Заведение закрывается в 23:00. Выбранное время ({reservation.time}) и продолжительность ({reservation.duration} ч) превышают время работы."
+        )
 
+    # Проверяем, не прошло ли время для сегодняшнего дня (по МСК)
+    reservation_date = datetime.strptime(reservation.date, "%Y-%m-%d").date()
+    reservation_time = datetime.strptime(reservation.time, "%H:%M").time()
+    
+    # Если бронирование на сегодня по МСК
+    today_moscow = now_moscow.date()
+    if reservation_date == today_moscow:
+        current_time_moscow = now_moscow.time()
+        buffer_datetime = now_moscow + timedelta(minutes=60)
+        buffer_time = buffer_datetime.time()
+        
+        if reservation_time <= buffer_time:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Нельзя бронировать время, которое уже прошло или слишком близко к текущему времени по МСК ({now_moscow.strftime('%H:%M')}). Минимум за час."
+            )
+
+    # Проверяем доступность времени
     if not crud.is_time_slot_available(reservation.date, reservation.time, reservation.duration, reservation.place):
         raise HTTPException(status_code=400, detail="Нет свободных столиков на это время")
 
@@ -93,9 +65,33 @@ def check(
     duration: int = Query(1),
     place: str = Query(...),
 ):
-    end_time = (datetime.strptime(time, "%H:%M") + timedelta(hours=duration)).time()
-    if end_time > datetime.strptime("23:00", "%H:%M").time():
-        return {"free": 0}
+    # Проверяем время закрытия (23:00)
+    start_time = datetime.strptime(time, "%H:%M")
+    end_time = start_time + timedelta(hours=duration)
+    
+    if end_time.time() > datetime.strptime("23:00", "%H:%M").time():
+        return {"free": 0, "reason": "closing_time"}
+    
+    # Проверяем, не прошло ли время для сегодняшнего дня
+    try:
+        check_date = datetime.strptime(date, "%Y-%m-%d").date()
+        check_time = datetime.strptime(time, "%H:%M").time()
+        
+        # Если проверка на сегодня
+        today = datetime.now().date()
+        if check_date == today:
+            current_datetime = datetime.now()
+            buffer_datetime = current_datetime + timedelta(minutes=60)  # Буфер 1 час
+            
+            # Создаем datetime для проверяемого времени
+            check_datetime = datetime.combine(check_date, check_time)
+            
+            if check_datetime <= buffer_datetime:
+                return {"free": 0, "reason": "time_passed"}
+    
+    except ValueError:
+        return {"free": 0, "reason": "invalid_date_time"}
+    
     free = crud.get_free_tables(date, time, duration, place)
     return {"free": free}
 
@@ -186,12 +182,15 @@ async def cancel_reservation(user_id: str, date: str, time: str, cancelled_at: s
         print(f"✅ Found reservation to cancel: {reservation_key}")
         
         # Обновляем статус брони
+        utc_now = datetime.now(pytz.UTC)
         update_data = {
             "cancelled": True,
             "status": "cancelled",
-            "confirmed": False,  # Снимаем подтверждение если было
-            "cancelled_at": cancelled_at or datetime.now().isoformat()
+            "confirmed": False,
+            "cancelled_at": utc_now.isoformat()  # Сохраняем в UTC
         }
+        
+        ref.child(reservation_key).update(update_data)
         
         print(f"Updating with data: {update_data}")
         
@@ -312,6 +311,7 @@ async def debug_database_structure():
 @app.post("/confirm")
 async def confirm_reservation(user_id: str, date: str, time: str):
     """Подтверждает бронь"""
+    import pytz
     try:
         ref = db.reference("/reservations")
         data = ref.get() or {}
@@ -329,11 +329,12 @@ async def confirm_reservation(user_id: str, date: str, time: str):
         if not reservation_key:
             return {"error": "Reservation not found"}
         
-        # Подтверждаем бронь
+        # Подтверждаем бронь с временем в UTC
+        utc_now = datetime.now(pytz.UTC)
         update_data = {
             "confirmed": True,
             "status": "confirmed",
-            "confirmed_at": datetime.now().isoformat()
+            "confirmed_at": utc_now.isoformat()
         }
         
         ref.child(reservation_key).update(update_data)
@@ -410,4 +411,195 @@ async def mark_preorder(user_id: str, date: str, time: str, preorder_at: str = N
         print(f"❌ ERROR in mark_preorder: {e}")
         import traceback
         traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.post("/reserve")
+def reserve(reservation: schemas.ReservationCreate):
+    import pytz
+    
+    # Получаем московское время
+    moscow_tz = pytz.timezone('Europe/Moscow')
+    now_moscow = datetime.now(moscow_tz)
+    
+    # Проверяем время закрытия заведения
+    end_time = (datetime.strptime(reservation.time, "%H:%M") + timedelta(hours=reservation.duration)).time()
+    if end_time > datetime.strptime("22:00", "%H:%M").time():
+        raise HTTPException(status_code=400, detail="Кафе закрывается в 22:00")
+
+    # Проверяем, не прошло ли время для сегодняшнего дня (по МСК)
+    reservation_date = datetime.strptime(reservation.date, "%Y-%m-%d").date()
+    reservation_time = datetime.strptime(reservation.time, "%H:%M").time()
+    
+    # Если бронирование на сегодня по МСК
+    today_moscow = now_moscow.date()
+    if reservation_date == today_moscow:
+        current_time_moscow = now_moscow.time()
+        buffer_datetime = now_moscow + timedelta(minutes=60)
+        buffer_time = buffer_datetime.time()
+        
+        if reservation_time <= buffer_time:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Нельзя бронировать время, которое уже прошло или слишком близко к текущему времени по МСК ({now_moscow.strftime('%H:%M')}). Минимум за час."
+            )
+
+    # Проверяем доступность времени
+    if not crud.is_time_slot_available(reservation.date, reservation.time, reservation.duration, reservation.place):
+        raise HTTPException(status_code=400, detail="Нет свободных столиков на это время")
+
+    return crud.create_reservation(reservation)
+
+@app.get("/check")
+def check(
+    date: str = Query(...),
+    time: str = Query(...),
+    duration: int = Query(1),
+    place: str = Query(...),
+):
+    # Проверяем время закрытия
+    end_time = (datetime.strptime(time, "%H:%M") + timedelta(hours=duration)).time()
+    if end_time > datetime.strptime("23:00", "%H:%M").time():
+        return {"free": 0}
+    
+    # Проверяем, не прошло ли время для сегодняшнего дня
+    try:
+        check_date = datetime.strptime(date, "%Y-%m-%d").date()
+        check_time = datetime.strptime(time, "%H:%M").time()
+        
+        # Если проверка на сегодня
+        today = datetime.now().date()
+        if check_date == today:
+            current_datetime = datetime.now()
+            buffer_datetime = current_datetime + timedelta(minutes=60)  # Буфер 1 час
+            
+            # Создаем datetime для проверяемого времени
+            check_datetime = datetime.combine(check_date, check_time)
+            
+            if check_datetime <= buffer_datetime:
+                return {"free": 0, "reason": "time_passed"}
+    
+    except ValueError:
+        return {"free": 0, "reason": "invalid_date_time"}
+    
+    free = crud.get_free_tables(date, time, duration, place)
+    return {"free": free}
+
+@app.post("/remove_preorder")
+async def remove_preorder(user_id: str, date: str, time: str):
+    """Снимает отметку предзаказа с брони"""
+    try:
+        ref = db.reference("/reservations")
+        data = ref.get() or {}
+        
+        reservation_key = None
+        
+        # Находим нужную бронь
+        for key, reservation in data.items():
+            if (str(reservation.get("user_id")) == str(user_id) and
+                reservation.get("date") == date and
+                reservation.get("time") == time):
+                reservation_key = key
+                break
+        
+        if not reservation_key:
+            return {"error": "Reservation not found"}
+        
+        # Снимаем предзаказ
+        update_data = {
+            "preorder": False,
+            "preorder_at": None
+        }
+        
+        ref.child(reservation_key).update(update_data)
+        
+        return {
+            "message": "Preorder removed successfully",
+            "id": reservation_key
+        }
+        
+    except Exception as e:
+        print(f"Error removing preorder: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+
+@app.delete("/delete_reservation/{reservation_id}")
+async def delete_reservation(reservation_id: str):
+    """Удаляет бронь по ID"""
+    try:
+        ref = db.reference("/reservations")
+        
+        # Проверяем, существует ли бронь
+        reservation = ref.child(reservation_id).get()
+        if not reservation:
+            raise HTTPException(status_code=404, detail="Reservation not found")
+        
+        # Удаляем бронь
+        ref.child(reservation_id).delete()
+        
+        return {
+            "message": "Reservation deleted successfully",
+            "deleted_id": reservation_id,
+            "deleted_reservation": reservation
+        }
+        
+    except Exception as e:
+        print(f"Error deleting reservation: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/get_old_reservations")
+async def get_old_reservations(months_back: int = 2):
+    """Получает старые брони за указанное количество месяцев"""
+    try:
+        from datetime import datetime, timedelta
+        import pytz
+        
+        # Получаем московское время
+        moscow_tz = pytz.timezone('Europe/Moscow')
+        now_moscow = datetime.now(moscow_tz)
+        current_date_moscow = now_moscow.date()
+        
+        # Вычисляем дату N месяцев назад
+        past_date = current_date_moscow - timedelta(days=months_back * 30)
+        
+        ref = db.reference("/reservations")
+        data = ref.get() or {}
+        
+        old_reservations = {}
+        
+        for key, reservation in data.items():
+            try:
+                reservation_date_str = reservation.get("date")
+                if not reservation_date_str:
+                    continue
+                    
+                reservation_date = datetime.strptime(reservation_date_str, "%Y-%m-%d").date()
+                
+                # Проверяем, что бронь старше 2 месяцев
+                if reservation_date < past_date:
+                    old_reservations[key] = {
+                        **reservation,
+                        "reservation_id": key,
+                        "days_ago": (current_date_moscow - reservation_date).days
+                    }
+                    
+            except (ValueError, TypeError) as e:
+                print(f"Error processing reservation {key}: {e}")
+                continue
+        
+        # Сортируем по дате (старые сначала)
+        sorted_reservations = dict(
+            sorted(
+                old_reservations.items(), 
+                key=lambda x: x[1].get("date", "")
+            )
+        )
+        
+        return {
+            "old_reservations": sorted_reservations,
+            "total_count": len(sorted_reservations)
+        }
+        
+    except Exception as e:
+        print(f"Error getting old reservations: {e}")
         raise HTTPException(status_code=500, detail=str(e))
